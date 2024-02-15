@@ -15,8 +15,57 @@ MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD')
 MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE')
 MYSQL_PORT = os.environ.get('MYSQL_PORT') or 3306
 
-#ALLOWED_ORIGIN = ['http://127.0.0.1:5173', 'https://archivista-ng.provincia.lucca.it']
+#ALLOWED_ORIGIN = ['http://127.0.0.1:5173', 'http://127.0.0.1', 'https://archivista-ng.provincia.lucca.it']
 ALLOWED_ORIGIN = ['https://archivista-ng.provincia.lucca.it']
+
+def check_tree_published(fond_id):
+    result = False
+
+    logger = logging.getLogger()
+    query_results = []
+    results = {}
+    
+    logger.debug(f"Checking fond_id: {fond_id}")
+
+    conn = mysql.connector.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        port=MYSQL_PORT
+    )
+
+    cursor = conn.cursor(dictionary=True)
+
+    query = """ 
+            SELECT ancestry  
+            FROM 
+            `fonds` f 
+            where 
+            f.published = 1 
+            AND 
+            f.trashed = 0
+            AND 
+            f.id = %s;"""
+
+    valori = (fond_id,)
+    cursor.execute(query, valori)
+    query_result = cursor.fetchall()
+
+    for item in query_result:
+        if (item["ancestry"] is None):
+            logger.debug(f"Found an item to publish {fond_id} !")
+            result = True
+        else:
+            logger.debug(f"Investigating on parent {fond_id}...")
+
+            ancestry_parent = item["ancestry"].split("/")
+            ancestry_parent_last = ancestry_parent[-1]
+            result = check_tree_published(ancestry_parent_last)
+
+    return result
+
+
 
 def mysql_search(words, logic):
     logger = logging.getLogger()
@@ -69,7 +118,8 @@ def mysql_search(words, logic):
 
         logger.debug(f"Found {len(query_result)} items")
         for item in query_result:
-            query_results.append(item)
+            if (check_tree_published(item["fond_id"])):
+                query_results.append(item)
         
 
     logger.debug(f"All results : {query_results}")
