@@ -7,7 +7,7 @@ from copy import deepcopy
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG, format=f'%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s')
 
-VERSION="1.0.0-b1"
+VERSION="1.0.1"
 
 MYSQL_HOST = os.environ.get('MYSQL_HOST')
 MYSQL_USER = os.environ.get('MYSQL_USER')
@@ -15,15 +15,13 @@ MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD')
 MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE')
 MYSQL_PORT = os.environ.get('MYSQL_PORT') or 3306
 
-#ALLOWED_ORIGIN = ['http://127.0.0.1:5173', 'http://127.0.0.1', 'https://archivista-ng.provincia.lucca.it']
+#ALLOWED_ORIGIN = ['http://127.0.0.1:5173', 'http://localhost:5173', 'http://127.0.0.1', 'https://archivista-ng.provincia.lucca.it']
 ALLOWED_ORIGIN = ['https://archivista-ng.provincia.lucca.it']
 
 def check_tree_published(fond_id):
     result = False
 
     logger = logging.getLogger()
-    query_results = []
-    results = {}
     
     logger.debug(f"Checking fond_id: {fond_id}")
 
@@ -65,14 +63,56 @@ def check_tree_published(fond_id):
 
     return result
 
+def get_ancestor(fond_id):
+    result = None
+
+    logger = logging.getLogger()
+    logger.debug(f"Get ancestor: {fond_id}")
+
+    conn = mysql.connector.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        port=MYSQL_PORT
+    )
+
+    cursor = conn.cursor(dictionary=True)
+
+    query = """ 
+            SELECT ancestry  
+            FROM 
+            `fonds` 
+            where 
+            id = %s;"""
+
+    valori = (fond_id,)
+    cursor.execute(query, valori)
+    record = cursor.fetchone()
+
+    cursor.close()
+    if (record["ancestry"] is None):
+        result = fond_id
+    else:
+        ancestry_parent = record["ancestry"].split("/")
+        result = ancestry_parent[0]
+
+    logger.debug(f"Ancestry: {result}")
+    return int(result)
 
 
-def mysql_search(words, logic):
+
+def mysql_search(words, complex, logic):
     logger = logging.getLogger()
     query_results = []
+    allowed_complex = []
     results = {}
     
-    logger.debug(f"MySQL User: {MYSQL_USER}")
+    if (len(complex) != 0):
+        for item in complex:
+            allowed_complex.append(item["fond_id"])
+
+    logger.debug(f"Allowed complex: {allowed_complex}")
 
     conn = mysql.connector.connect(
         host=MYSQL_HOST,
@@ -88,7 +128,7 @@ def mysql_search(words, logic):
     cursor.execute(only_full_group_by)   
 
     query = """ 
-            SELECT u.id as unit_id, f.name as fond_name, u.fond_id as fond_id, u.title as title, u.content as content, u.arrangement_note as note, t.isri as textual, v.stmd as visual, s.sgti as extended 
+            SELECT u.id as unit_id, f.name as fond_name, u.fond_id as fond_id, u.root_fond_id as root_fond_id, u.title as title, u.content as content, u.arrangement_note as note, t.isri as textual, v.stmd as visual, s.sgti as extended 
             FROM 
             `units` u 
             join fonds f on u.root_fond_id = f.id
@@ -118,8 +158,15 @@ def mysql_search(words, logic):
 
         logger.debug(f"Found {len(query_result)} items")
         for item in query_result:
+            logger.debug(f"Checking item id {item['unit_id']}")
             if (check_tree_published(item["fond_id"])):
-                query_results.append(item)
+                if (len(allowed_complex) != 0):
+                    if (item['root_fond_id'] in allowed_complex):
+                        query_results.append(item)
+                    else:
+                        logger.debug(f"Complex not allowed {item['root_fond_id']}")
+                else:
+                    query_results.append(item)
         
 
     logger.debug(f"All results : {query_results}")
@@ -183,11 +230,12 @@ def mysql_search(words, logic):
         logger.debug(f"{temp_results}")
         for item in temp_results:
             unit = temp_results[item]
-            logger.debug(f"hhh {len(words)}")
+            logger.debug(f"Number of count {unit['count']}")
             if int(unit["count"]) >= len(words):
                 results[item] = unit
     else:
         results = temp_results
+            
 
     cursor.close()
     conn.close()
@@ -217,6 +265,70 @@ def origin_allowed(origin):
 
     return allowed
 
+@app.route('/archi-complex', methods=['GET', 'OPTIONS'])
+def lista_complessi():
+    logger = logging.getLogger()
+    origin = None
+    query_results = []
+    results = {}
+
+    try:
+        origin = request.headers.get('Origin')
+        logger.info(f"Origin : {origin}")
+
+        if origin_allowed(origin):
+            if request.method == "OPTIONS": # CORS preflight
+                return _build_cors_preflight_response(origin)
+            elif request.method == "GET": 
+                conn = mysql.connector.connect(
+                    host=MYSQL_HOST,
+                    user=MYSQL_USER,
+                    password=MYSQL_PASSWORD,
+                    database=MYSQL_DATABASE,
+                    port=MYSQL_PORT
+                )
+
+                cursor = conn.cursor(dictionary=True)
+
+                only_full_group_by = "SET GLOBAL sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''));"
+                cursor.execute(only_full_group_by)   
+
+                query = """ 
+                        SELECT id, name 
+                        FROM 
+                        fonds
+                        where 
+                        ancestry is null
+                        AND 
+                        published = 1 
+                        ;"""
+                
+                cursor.execute(query)
+                query_result = cursor.fetchall()
+
+                logger.debug(f"Found {len(query_result)} items")
+                for complex in query_result:
+                   query_results.append({"fond_id" : complex["id"], "fond_name" : complex["name"]})
+
+                results["data"] = query_results
+                results["status"] = "ok"
+
+            else:
+                raise RuntimeError("Weird - don't know how to handle method {}".format(request.method))
+        else:
+            logger.info(f"Origin ({origin}) not allowed")
+        
+    
+    except Exception as error:
+        logger.error(f"Error : {repr(error)}")
+        results['status'] = "error"
+        results['message'] = repr(error)
+     
+    logger.debug(f"Result : {results}")
+    return _corsify_actual_response(jsonify(results), origin)
+    #return jsonify(risultati)
+
+
 
 @app.route('/archi-search', methods=['POST', 'OPTIONS'])
 def esegui_ricerca():
@@ -241,10 +353,14 @@ def esegui_ricerca():
                 if "logic" not in request_data:
                     raise MissingElement("Logica di ricerca mancante")
                 
+                if "complex" not in request_data:
+                    raise MissingElement("Complessi mancanti")
+                
                 words = request_data['words']
                 logic = request_data['logic'].lower()
+                complex = request_data['complex']
                 
-                data = mysql_search(words, logic)
+                data = mysql_search(words, complex, logic)
 
                 result['status'] = 'ok'
                 result['data'] = data
